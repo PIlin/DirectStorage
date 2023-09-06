@@ -87,6 +87,8 @@ Metadata GenerateUncompressedMetadata(wchar_t const* filename, uint32_t chunkSiz
     return metadata;
 }
 
+
+
 com_ptr<IDStorageCompressionCodec> GetCodec(DSTORAGE_COMPRESSION_FORMAT format)
 {
     com_ptr<IDStorageCompressionCodec> codec;
@@ -101,6 +103,8 @@ com_ptr<IDStorageCompressionCodec> GetCodec(DSTORAGE_COMPRESSION_FORMAT format)
         codec = winrt::make<ZLibCodec>();
         break;
 #endif
+
+
 
     default:
         std::terminate();
@@ -268,6 +272,41 @@ struct TestResult
     uint64_t ProcessCycles;
 };
 
+// TODO: had memory tramples and crashes because there is still some work in queue
+// even after events/fences are signalled
+void AssertQueueEmpty(IDStorageQueue* pQueue)
+{
+    return;  // uncomment for possible crash
+
+    bool wtfFlush = true; // this should never happen, workaround
+    const int maxRetry = 100;
+    int retry = 0;
+    for (int retry = 0; true; ++retry)
+    {
+        DSTORAGE_QUEUE_INFO info;
+        pQueue->Query(&info);
+        if (info.Desc.Capacity - 1 != info.EmptySlotCount)
+        {
+            const char* name = info.Desc.SourceType == DSTORAGE_REQUEST_SOURCE_FILE ? "file" : "mem";
+            std::cout << "The DirectStorage " << name << " queue is not empty!\n"
+                      << "Expected " << (info.Desc.Capacity - 1) << ", but got " << info.EmptySlotCount << std::endl;
+
+            if (!wtfFlush || retry >= maxRetry)
+            {
+                std::terminate();
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::cout << "Retry " << retry << std::endl;
+        }
+        else
+        {
+            return;
+        }
+    }
+};
+
+
 TestResult RunTest(
     IDStorageFactory* factory,
     uint32_t stagingSizeMiB,
@@ -339,6 +378,7 @@ TestResult RunTest(
 
     for (int i = 0; i < numRuns; ++i)
     {
+        AssertQueueEmpty(queue.get());
         check_hresult(fence->SetEventOnCompletion(fenceValue, fenceEvent.get()));
 
         // Enqueue requests to load each compressed chunk.
@@ -418,6 +458,7 @@ TestResult RunTest(
             std::cout << ".";
         }
         ++fenceValue;
+        AssertQueueEmpty(queue.get());
     }
 
     meanBandwidth /= numRuns;
@@ -429,6 +470,272 @@ TestResult RunTest(
     return {meanBandwidth, meanCycleTime};
 }
 
+
+TestResult RunTestDecrypt(
+    IDStorageFactory* factory,
+    uint32_t stagingSizeMiB,
+    wchar_t const* sourceFilename,
+    DSTORAGE_COMPRESSION_FORMAT compressionFormat,
+    Metadata const& metadata,
+    int numRuns)
+{
+    com_ptr<IDStorageFile> file;
+
+    HRESULT hr = factory->OpenFile(sourceFilename, IID_PPV_ARGS(file.put()));
+    if (FAILED(hr))
+    {
+        std::wcout << L"The file '" << sourceFilename << L"' could not be opened. HRESULT=0x" << std::hex << hr
+                   << std::endl;
+        std::abort();
+    }
+
+    // The staging buffer size must be set before any queues are created.
+    std::cout << "  " << stagingSizeMiB << " MiB staging buffer: ";
+    check_hresult(factory->SetStagingBufferSize(stagingSizeMiB * 1024 * 1024));
+
+    com_ptr<ID3D12Device> device;
+    check_hresult(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&device)));
+
+
+    com_ptr<IDStorageQueue1> fileQueue;
+    com_ptr<IDStorageQueue1> memQueue;
+
+    // Create a DirectStorage queue which will be used to load data into a
+    // buffer on the GPU.
+    {
+        DSTORAGE_QUEUE_DESC queueDesc{};
+        queueDesc.Capacity = DSTORAGE_MAX_QUEUE_CAPACITY;
+        queueDesc.Priority = DSTORAGE_PRIORITY_NORMAL;
+        queueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+        //queueDesc.Device = device.get();
+
+        check_hresult(factory->CreateQueue(&queueDesc, IID_PPV_ARGS(fileQueue.put())));
+    }
+
+    {
+        DSTORAGE_QUEUE_DESC queueDesc{};
+        queueDesc.Capacity = DSTORAGE_MAX_QUEUE_CAPACITY;
+        queueDesc.Priority = DSTORAGE_PRIORITY_REALTIME;
+        queueDesc.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+        queueDesc.Device = device.get();
+
+        check_hresult(factory->CreateQueue(&queueDesc, IID_PPV_ARGS(memQueue.put())));
+    }
+
+    // Create the ID3D12Resource buffer which will be populated with the file's contents
+    D3D12_HEAP_PROPERTIES bufferHeapProps = {};
+    bufferHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC bufferDesc = {};
+    bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufferDesc.Width = metadata.UncompressedSize;
+    bufferDesc.Height = 1;
+    bufferDesc.DepthOrArraySize = 1;
+    bufferDesc.MipLevels = 1;
+    bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+    bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bufferDesc.SampleDesc.Count = 1;
+
+    com_ptr<ID3D12Resource> bufferResource;
+    check_hresult(device->CreateCommittedResource(
+        &bufferHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &bufferDesc,
+        D3D12_RESOURCE_STATE_COMMON,
+        nullptr,
+        IID_PPV_ARGS(bufferResource.put())));
+
+    // Configure a fence to be signaled when the request is completed
+    com_ptr<ID3D12Fence> fence;
+    check_hresult(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.put())));
+
+    ScopedHandle fenceEvent(CreateEvent(nullptr, FALSE, FALSE, nullptr));
+    ScopedHandle memEvent(CreateEvent(nullptr, FALSE, FALSE, nullptr));
+    ScopedHandle decryptFenceEvent(CreateEvent(nullptr, FALSE, FALSE, nullptr));
+    uint64_t fenceValue = 1;
+
+    double meanBandwidth = 0;
+    uint64_t meanCycleTime = 0;
+
+    std::unique_ptr<char[]> pTemp(new char[metadata.CompressedSize]);
+
+
+
+    
+
+    for (int i = 0; i < numRuns; ++i)
+    {
+        memset(pTemp.get(), 0xdd, metadata.CompressedSize);
+
+        AssertQueueEmpty(memQueue.get());
+        AssertQueueEmpty(fileQueue.get());
+
+        ResetEvent(decryptFenceEvent.get());
+
+        // Enqueue requests to decrypt each compressed chunk.
+        {
+            uint32_t destOffset = 0;
+            for (auto const& chunk : metadata.Chunks)
+            {
+                // TODO: communicate decryption keys/params to decryptor
+                // For example, put them to destination buffer
+                // Alternatively, maybe destination address can be used as a key to some other data structure
+                char* pDest = pTemp.get() + destOffset;
+                const char key[] = "hello";
+                memcpy(pDest, key, sizeof(key));
+
+                DSTORAGE_REQUEST request = {};
+                request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+                request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
+                request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT(DSTORAGE_CUSTOM_COMPRESSION_0 + 1);
+                request.Source.File.Source = file.get();
+                request.Source.File.Offset = chunk.Offset;
+                request.Source.File.Size = chunk.CompressedSize;
+                request.UncompressedSize = chunk.CompressedSize;
+                request.Destination.Memory.Buffer = pDest;
+                request.Destination.Memory.Size = chunk.CompressedSize;
+                fileQueue->EnqueueRequest(&request);
+                destOffset += chunk.CompressedSize;
+            }
+        }
+
+        // Signal the fence when done
+        fileQueue->EnqueueSetEvent(decryptFenceEvent.get());
+
+        auto startTime = std::chrono::high_resolution_clock::now();
+        auto startCycleTime = GetProcessCycleTime();
+
+        // Tell DirectStorage to start executing all queued items.
+        fileQueue->Submit();
+
+        // Wait for the submitted work to complete
+        WaitForSingleObject(decryptFenceEvent.get(), INFINITE);
+
+        // If an error was detected the first failure record
+        // can be retrieved to get more details.
+        DSTORAGE_ERROR_RECORD errorRecord{};
+        fileQueue->RetrieveErrorRecord(&errorRecord);
+        if (FAILED(errorRecord.FirstFailure.HResult))
+        {
+            //
+            // errorRecord.FailureCount - The number of failed requests in the queue since the last
+            //                            RetrieveErrorRecord call.
+            // errorRecord.FirstFailure - Detailed record about the first failed command in the enqueue order.
+            //
+            std::cout << "The DirectStorage request failed! HRESULT=0x" << std::hex << errorRecord.FirstFailure.HResult
+                      << std::endl;
+
+            if (errorRecord.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST)
+            {
+                auto& r = errorRecord.FirstFailure.Request.Request;
+
+                std::cout << std::dec << "   " << r.Source.File.Offset << "   " << r.Source.File.Size << std::endl;
+            }
+            std::terminate();
+        }
+
+        AssertQueueEmpty(fileQueue.get());
+
+
+        /////////////
+
+        AssertQueueEmpty(memQueue.get());
+
+        check_hresult(fence->SetEventOnCompletion(fenceValue, fenceEvent.get()));
+        ResetEvent(memEvent.get());
+
+        // Enqueue requests to load each compressed chunk.
+        {
+            uint32_t srcOffset = 0;
+            uint32_t destOffset = 0;
+            for (auto const& chunk : metadata.Chunks)
+            {
+                DSTORAGE_REQUEST request = {};
+                request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+                request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_BUFFER;
+                request.Options.CompressionFormat = compressionFormat;
+                request.Source.Memory.Source = pTemp.get() + srcOffset;
+                request.Source.Memory.Size = chunk.CompressedSize;
+                request.UncompressedSize = chunk.UncompressedSize;
+                request.Destination.Buffer.Resource = bufferResource.get();
+                request.Destination.Buffer.Offset = destOffset;
+                request.Destination.Buffer.Size = chunk.UncompressedSize;
+                memQueue->EnqueueRequest(&request);
+                srcOffset += chunk.CompressedSize;
+                destOffset += chunk.UncompressedSize;
+            }
+        }
+
+        memQueue->EnqueueSignal(fence.get(), fenceValue);
+        memQueue->EnqueueSetEvent(memEvent.get());
+
+        memQueue->Submit();
+
+        // Wait for the submitted work to complete
+        WaitForSingleObject(fenceEvent.get(), INFINITE);
+        WaitForSingleObject(memEvent.get(), INFINITE);
+
+        auto endCycleTime = GetProcessCycleTime();
+        auto endTime = std::chrono::high_resolution_clock::now();
+
+        if (fence->GetCompletedValue() == (uint64_t)-1)
+        {
+            // Device removed!  Give DirectStorage a chance to detect the error.
+            Sleep(5);
+        }
+
+        // If an error was detected the first failure record
+        // can be retrieved to get more details.
+        //DSTORAGE_ERROR_RECORD errorRecord{};
+        errorRecord = {};
+        memQueue->RetrieveErrorRecord(&errorRecord);
+        if (FAILED(errorRecord.FirstFailure.HResult))
+        {
+            //
+            // errorRecord.FailureCount - The number of failed requests in the queue since the last
+            //                            RetrieveErrorRecord call.
+            // errorRecord.FirstFailure - Detailed record about the first failed command in the enqueue order.
+            //
+            std::cout << "The DirectStorage request failed! HRESULT=0x" << std::hex << errorRecord.FirstFailure.HResult
+                      << std::endl;
+
+            if (errorRecord.FirstFailure.CommandType == DSTORAGE_COMMAND_TYPE_REQUEST)
+            {
+                auto& r = errorRecord.FirstFailure.Request.Request;
+
+                std::cout << std::dec << "   " << r.Source.File.Offset << "   " << r.Source.File.Size << std::endl;
+            }
+            std::terminate();
+        }
+        else
+        {
+            auto duration = endTime - startTime;
+
+            using dseconds = std::chrono::duration<double>;
+
+            double durationInSeconds = std::chrono::duration_cast<dseconds>(duration).count();
+            double bandwidth = (metadata.UncompressedSize / durationInSeconds) / 1000.0 / 1000.0 / 1000.0;
+            meanBandwidth += bandwidth;
+
+            meanCycleTime += (endCycleTime - startCycleTime);
+
+            std::cout << ".";
+        }
+        ++fenceValue;
+
+        AssertQueueEmpty(memQueue.get());
+    }
+
+    meanBandwidth /= numRuns;
+    meanCycleTime /= numRuns;
+
+    std::cout << "  " << meanBandwidth << " GB/s"
+              << " mean cycle time: " << std::dec << meanCycleTime << std::endl;
+
+    return {meanBandwidth, meanCycleTime};
+}
+
+
 int wmain(int argc, wchar_t* argv[])
 {
     enum class TestCase
@@ -438,16 +745,22 @@ int wmain(int argc, wchar_t* argv[])
         CpuZLib,
 #endif
         CpuGDeflate,
-        GpuGDeflate
+        GpuGDeflate,
+        Decrypt_Uncompressed,
+        Decrypt_GpuGDeflate
     };
 
     TestCase testCases[] =
-    { TestCase::Uncompressed,
+    { 
+      TestCase::Uncompressed,
 #if USE_ZLIB
       TestCase::CpuZLib,
 #endif
       TestCase::CpuGDeflate,
-      TestCase::GpuGDeflate };
+      TestCase::GpuGDeflate,
+      TestCase::Decrypt_Uncompressed,
+      TestCase::Decrypt_GpuGDeflate
+    };
 
     if (argc < 2)
     {
@@ -546,6 +859,22 @@ int wmain(int argc, wchar_t* argv[])
             std::cout << "GPU GDEFLATE:" << std::endl;
             break;
 
+         case TestCase::Decrypt_Uncompressed:
+            compressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
+            numRuns = 10;
+            metadata = &uncompressedMetadata;
+            filename = originalFilename;
+            std::cout << "Decrypt + Uncompressed:" << std::endl;
+            break;
+
+        case TestCase::Decrypt_GpuGDeflate:
+            compressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
+            numRuns = 10;
+            metadata = &gdeflateMetadata;
+            filename = gdeflateFilename.c_str();
+            std::cout << "Decrypt + GPU GDEFLATE:" << std::endl;
+            break;
+
         default:
             std::terminate();
         }
@@ -557,14 +886,18 @@ int wmain(int argc, wchar_t* argv[])
 
         factory->SetDebugFlags(DSTORAGE_DEBUG_SHOW_ERRORS | DSTORAGE_DEBUG_BREAK_ON_ERROR);
 
-        CustomDecompression customDecompression(factory.get(), std::thread::hardware_concurrency());
+        int numThreads = std::thread::hardware_concurrency();
+        //numThreads = 4;
+        CustomDecompression customDecompression(factory.get(), numThreads);
 
         for (uint32_t stagingSizeMiB = 1; stagingSizeMiB <= MAX_STAGING_BUFFER_SIZE; stagingSizeMiB *= 2)
         {
             if (stagingSizeMiB < chunkSizeMiB)
                 continue;
 
-            TestResult data = RunTest(factory.get(), stagingSizeMiB, filename, compressionFormat, *metadata, numRuns);
+            TestResult data = (testCase == TestCase::Decrypt_GpuGDeflate || testCase == TestCase::Decrypt_Uncompressed)
+                ? RunTestDecrypt(factory.get(), stagingSizeMiB, filename, compressionFormat, *metadata, numRuns)
+                : RunTest(factory.get(), stagingSizeMiB, filename, compressionFormat, *metadata, numRuns);
 
             results.push_back({testCase, stagingSizeMiB, data});
         }
@@ -575,8 +908,36 @@ int wmain(int argc, wchar_t* argv[])
     std::wstringstream bandwidth;
     std::wstringstream cycles;
 
-    std::wstring header =
-        L"\"Staging Buffer Size MiB\"\t\"Uncompressed\"\t\"ZLib\"\t\"CPU GDEFLATE\"\t\"GPU GDEFLATE\"";
+    std::wstringstream headerStrm;
+    headerStrm << L"\"Staging Buffer Size MiB\"";
+    for (TestCase testCase : testCases)
+    {
+        switch (testCase)
+        {
+        case TestCase::Uncompressed:
+            headerStrm << L"\t\"Uncompressed\"";
+            break;
+#if USE_ZLIB
+        case TestCase::CpuZLib:
+            headerStrm << L"\t\"ZLib\"";
+            break;
+#endif
+        case TestCase::CpuGDeflate:
+            headerStrm << L"\t\"CPU GDEFLATE\"";
+            break;
+        case TestCase::GpuGDeflate: 
+            headerStrm << L"\t\"GPU GDEFLATE\"";
+            break;
+        case TestCase::Decrypt_Uncompressed:
+            headerStrm << L"\t\"Decrypt + Uncompressed\"";
+            break;
+        case TestCase::Decrypt_GpuGDeflate:
+            headerStrm << L"\t\"Decrypt + GDEFLATE\"";
+            break;
+        }
+    }
+
+    std::wstring header = headerStrm.str();
     bandwidth << header << std::endl;
     cycles << header << std::endl;
 

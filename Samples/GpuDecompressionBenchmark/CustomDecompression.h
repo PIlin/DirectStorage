@@ -15,9 +15,70 @@
 
 #include <deque>
 #include <mutex>
+#include <iostream>
 
 using winrt::check_hresult;
 using winrt::com_ptr;
+
+
+
+class DecryptCodec : public winrt::implements<DecryptCodec, IDStorageCompressionCodec>
+{
+public:
+    HRESULT STDMETHODCALLTYPE CompressBuffer(
+        const void* uncompressedData,
+        size_t uncompressedDataSize,
+        DSTORAGE_COMPRESSION compressionSetting,
+        void* compressedBuffer,
+        size_t compressedBufferSize,
+        size_t* compressedDataSize) override
+    {
+        return E_FAIL;
+    }
+
+    HRESULT STDMETHODCALLTYPE DecompressBuffer(
+        const void* compressedData,
+        size_t compressedDataSize,
+        void* uncompressedBuffer,
+        size_t uncompressedBufferSize,
+        size_t* uncompressedDataSize) override
+    {
+        uLong destLen = static_cast<uLong>(uncompressedBufferSize);
+
+        if (uncompressedBufferSize < compressedDataSize)
+        {
+            std::cout << "Destination buffer is too small for data\n";
+            return E_FAIL;
+        }
+
+        // TODO: put a real decrypt here
+
+        const char expectedKey[] = "hello";
+        if (uncompressedBufferSize < sizeof(expectedKey))
+        {
+            std::cout << "Destination buffer is too small for key\n";
+            return E_FAIL;
+        }
+
+        if (memcmp(expectedKey, uncompressedBuffer, sizeof(expectedKey)) != 0)
+        {
+            std::cout << "Corrupt key\n";
+            return E_FAIL;
+        }
+
+        memmove(uncompressedBuffer, compressedData, compressedDataSize);
+        *uncompressedDataSize = compressedDataSize;
+
+        return S_OK;
+    }
+
+    size_t STDMETHODCALLTYPE CompressBufferBound(size_t uncompressedDataSize) override
+    {
+        return uncompressedDataSize;
+    }
+};
+
+
 
 class Codec
 {
@@ -26,6 +87,8 @@ class Codec
 #if USE_ZLIB
     com_ptr<IDStorageCompressionCodec> m_zlibCodec;
 #endif
+
+    com_ptr<IDStorageCompressionCodec> m_decryptCodec;
 
     std::vector<uint8_t> m_stagingBuffer;
 
@@ -44,6 +107,8 @@ public:
 #if USE_ZLIB
         m_zlibCodec = winrt::make<ZLibCodec>();
 #endif
+
+        m_decryptCodec = winrt::make<DecryptCodec>();
     }
 
     size_t Decompress(
@@ -81,6 +146,11 @@ public:
                 codec = m_zlibCodec.get();
                 break;
 #endif
+
+            case DSTORAGE_CUSTOM_COMPRESSION_0 + 1:
+                codec = m_decryptCodec.get();
+                break;
+
             default:
                 std::terminate();
             }
@@ -101,6 +171,9 @@ public:
         return result;
     }
 
+
+
+
     void* GetDestination(DSTORAGE_CUSTOM_DECOMPRESSION_REQUEST const& request)
     {
         if (request.Flags & DSTORAGE_CUSTOM_DECOMPRESSION_FLAG_DEST_IN_UPLOAD_HEAP)
@@ -110,6 +183,10 @@ public:
             // write-combined memory, like an upload heap.  So instead the
             // decompression will target a staging buffer that we can then
             // memcpy into the upload heap.
+
+            // TODO: this can be optimized for the case of decrypt. Generally, needs to be decided
+            // for each specific codec.
+
             m_stagingBuffer.resize(request.DstSize);
             return m_stagingBuffer.data();
         }
